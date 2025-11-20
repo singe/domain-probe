@@ -459,7 +459,8 @@ async def resolver_worker(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Scan wildcard URLs for hosts serving APK/ZIP payloads requiring Range and UA headers.",
+        description="Fan out FUZZ tokens and '?' wildcards to fingerprint matching hosts.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
         "--config",
@@ -470,20 +471,15 @@ def parse_args() -> argparse.Namespace:
         "url_pattern",
         help="URL containing optional FUZZ and '?' placeholders to enumerate",
     )
-    parser.add_argument(
+
+    core_group = parser.add_argument_group("Core arguments")
+    core_group.add_argument(
         "-w",
         "--wordlist",
         type=Path,
         help="Path to newline-delimited values used to replace FUZZ",
     )
-    parser.add_argument(
-        "-c",
-        "--concurrency",
-        type=int,
-        default=8,
-        help="Number of simultaneous requests (default: 8)",
-    )
-    parser.add_argument(
+    core_group.add_argument(
         "--wildcard-space",
         default="a-z",
         help=(
@@ -491,80 +487,92 @@ def parse_args() -> argparse.Namespace:
             "and single-character ranges like 'a-z', '0-9', or mixed specs such as 'a,k,z,5-8'."
         ),
     )
-    parser.add_argument(
+    core_group.add_argument(
+        "-c",
+        "--concurrency",
+        type=int,
+        default=8,
+        help="Number of simultaneous requests.",
+    )
+    core_group.add_argument(
         "--limit",
         type=int,
         help="Maximum number of HTTP requests to issue (useful for very large permutations)",
     )
-    parser.add_argument(
-        "--timeout",
-        type=float,
-        default=10.0,
-        help="Total timeout per request in seconds",
-    )
-    parser.add_argument(
-        "--insecure",
-        action="store_true",
-        help="Disable TLS verification",
-    )
-    parser.add_argument(
-        "--csv",
-        dest="csv_path",
-        type=Path,
-        help="Write detailed probe results to this CSV file.",
-    )
-    parser.add_argument(
-        "--download-dir",
-        type=Path,
-        help="Directory to store full APK downloads for matching hosts.",
-    )
-    parser.add_argument(
-        "--stop-on-match",
-        action="store_true",
-        help="Exit early once the first positive match is found.",
-    )
-    parser.add_argument(
-        "--no-resolve-first",
-        dest="resolve_first",
-        action="store_false",
-        help="Skip DNS pre-checks (default performs a resolve before requesting).",
-    )
-    parser.add_argument(
-        "--resolve-concurrency",
-        type=int,
-        default=32,
-        help="Number of concurrent DNS lookups when --resolve-first is enabled (default: 32).",
-    )
-    parser.add_argument(
-        "--dns-timeout",
-        type=float,
-        default=2.0,
-        help="Seconds to wait for each DNS lookup before skipping (default: 2.0).",
-    )
-    parser.set_defaults(resolve_first=True)
-    parser.add_argument(
+
+    header_group = parser.add_argument_group("Header, match, and transport options")
+    header_group.add_argument(
         "--custom-header",
         action="append",
         dest="custom_headers",
         help="Additional header (Name: value). Default adds 'Range: bytes=0-4'. Provide multiple times as needed.",
     )
-    parser.add_argument(
+    header_group.add_argument(
         "--match-bytes",
         default="504b0304",
-        help="Hex-encoded byte prefix required for a match (default: 504b0304 for APK).",
+        help="Hex-encoded byte prefix required for a match.",
     )
-    parser.add_argument(
+    header_group.add_argument(
         "--match-status",
         type=int,
         action="append",
         dest="match_status",
         help="HTTP status code required for a match. Provide multiple times for multiple acceptable codes.",
     )
+    header_group.add_argument(
+        "--timeout",
+        type=float,
+        default=10.0,
+        help="Total timeout per request in seconds.",
+    )
+    header_group.add_argument(
+        "--insecure",
+        action="store_true",
+        help="Disable TLS verification.",
+    )
 
-    parser.add_argument(
+    dns_group = parser.add_argument_group("DNS and workflow controls")
+    dns_group.add_argument(
+        "--stop-on-match",
+        action="store_true",
+        help="Exit early once the first positive match is found.",
+    )
+    dns_group.add_argument(
+        "--no-resolve-first",
+        dest="resolve_first",
+        action="store_false",
+        help="Skip DNS pre-checks (default performs a resolve before requesting).",
+    )
+    dns_group.add_argument(
+        "--resolve-concurrency",
+        type=int,
+        default=32,
+        help="Number of concurrent DNS lookups when --resolve-first is enabled.",
+    )
+    dns_group.add_argument(
+        "--dns-timeout",
+        type=float,
+        default=2.0,
+        help="Seconds to wait for each DNS lookup before skipping.",
+    )
+    parser.set_defaults(resolve_first=True)
+
+    output_group = parser.add_argument_group("Output helpers and logging")
+    output_group.add_argument(
+        "--csv",
+        dest="csv_path",
+        type=Path,
+        help="Write detailed probe results to this CSV file.",
+    )
+    output_group.add_argument(
+        "--download-dir",
+        type=Path,
+        help="Directory to store full APK downloads for matching hosts.",
+    )
+    output_group.add_argument(
         "--verbose",
         action="store_true",
-        help="Enable verbose logging",
+        help="Enable verbose logging.",
     )
     args = parser.parse_args(_inject_config_args(parser))
     return args
