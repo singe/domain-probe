@@ -27,7 +27,7 @@ python domain_probe.py [OPTIONS] URL_PATTERN
 ```
 
 ### Core arguments
-- `URL_PATTERN`: Supports `FUZZ` tokens (replaced by wordlist values) and `?` wildcards.
+- `URL_PATTERN`: Supports `FUZZ` tokens (replaced by wordlist values) and `?` wildcards. For example, running `domain_probe.py 'https://FUZZ.???.example.net/payload.bin' -w names.txt --wildcard-space 'a-z'` enumerates every value in `names.txt` (e.g., `cdn`, `files`) combined with all three-letter permutations from `a` through `z`, producing URLs such as `https://cdn.abc.example.net/payload.bin` or `https://files.xyz.example.net/payload.bin`.
 - `-w, --wordlist PATH`: Newline-delimited list used to replace `FUZZ`.
 - `--wildcard-space SPEC`: Character/token set for `?`. Examples: `a-z` (default), `0-9a-z`, `foo,bar`, `a,k,z,5-8,10`.
 - `-c, --concurrency N`: HTTP worker count (default 8). Use higher values for larger scans.
@@ -55,23 +55,25 @@ python domain_probe.py [OPTIONS] URL_PATTERN
 ### Examples
 Check a single host (default APK-style bytes):
 ```bash
-python domain_probe.py 'https://dstv.dkzgo.cc/x/xc' \
-  --custom-header 'Rangex: bytes=0-4'
+python domain_probe.py 'https://static.example.net/releases/kit.bin' \
+  --custom-header 'Range: bytes=0-4'
 ```
 
 Brute-force three-letter subdomains plus FUZZ tokens while exporting results:
 ```bash
-python domain_probe.py 'https://FUZZ.???go.cc/x/xc' \
-  -w fuzz.txt --wildcard-space 'a-z' --csv scans/dstv.csv \
-  --custom-header 'Rangex: bytes=0-4' --verbose
+python domain_probe.py 'https://FUZZ.???.example.net/dropper.bin' \
+  -w fuzz.txt --wildcard-space 'a-z' --csv scans/example.csv \
+  --custom-header 'Range: bytes=0-4' --verbose
 ```
+If `fuzz.txt` contains values like `cdn` and `static`, this pattern will enumerate combinations such as `https://cdn.abc.example.net/dropper.bin` and `https://static.xyz.example.net/dropper.bin`, where `abc`/`xyz` iterate through every permutation described by `???` and the wildcard space.
 
 Full alphanumeric wildcard plus downloads:
 ```bash
-python domain_probe.py 'https://dstv.?kzgo.cc/x/xc' \
+python domain_probe.py 'https://cdn.?-assets.example.net/installers/FUZZ.bin' \
   --wildcard-space '0-9a-z' --download-dir artifacts \
-  --custom-header 'Rangex: bytes=0-4'
+  --custom-header 'Range: bytes=0-4'
 ```
+Here the single `?` before `-assets` cycles through the entire alphanumeric keyspace, while `FUZZ` pulls concrete filenames from the supplied wordlist—ideal when a kit reuses predictable naming conventions.
 
 ### Configuration files
 Supply `--config scan.cfg` to reuse a set of flags. The file is parsed line-by-line (comments start with `#`) using normal CLI syntax:
@@ -79,25 +81,25 @@ Supply `--config scan.cfg` to reuse a set of flags. The file is parsed line-by-l
 ```
 # scan.cfg
 --wildcard-space 0-9a-z
---custom-header "Rangex: bytes=0-4"
+--custom-header "Range: bytes=0-4"
 --match-status 206
 --match-status 200
 --resolve-concurrency 64
 --dns-timeout 1.0
---csv logs/dstv.csv
+--csv logs/example.csv
 ```
 
 Invoke with:
 
 ```bash
-python domain_probe.py --config scan.cfg 'https://FUZZ.???go.cc/x/xc' -w fuzz.txt
+python domain_probe.py --config scan.cfg 'https://FUZZ.???.example.net/dropper.bin' -w fuzz.txt
 ```
 
 ## Output summary
 Each run prints:
 ```
 Matched hosts:
-- https://dstv.dkzgo.cc/x/xc (status=206)
+- https://static.example.net/releases/kit.bin (status=206)
 Enumerated 26 URLs (DNS ok=1, failed=25); issued 1 HTTP probes, 1 matched.
 ```
 This reflects total permutations, DNS resolution results, HTTP attempts, and fingerprint-confirmed matches.
