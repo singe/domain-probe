@@ -1,1 +1,2 @@
 aiohttp>=3.13.2
+aiodns>=3.2.0

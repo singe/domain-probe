@@ -18,6 +18,8 @@ from typing import Iterable, Iterator, Sequence
 from urllib.parse import urlsplit
 
 import aiohttp
+import aiodns
+import pycares
 
 DOWNLOAD_RANGE_VALUE = "bytes=0-"
 DEFAULT_CUSTOM_HEADERS = ["Range: bytes=0-4"]
@@ -74,7 +76,9 @@ def read_wordlist(path: Path) -> list[str]:
     if not values:
         raise ValueError(f"FUZZ file {path} did not contain any usable values")
 
-    return values
+    # Preserve insertion order while removing duplicates up front so downstream
+    # enumeration does not need to maintain a giant seen-set per scan.
+    return list(dict.fromkeys(values))
 
 
 def expand_range(start: str, end: str) -> list[str]:
@@ -154,15 +158,21 @@ def expand_question_marks(pattern: str, wildcard_tokens: Sequence[str]) -> Itera
         yield pattern
         return
 
-    for combo in itertools.product(wildcard_tokens, repeat=len(positions)):
-        parts: list[str] = []
-        prev = 0
-        for pos, replacement in zip(positions, combo):
-            parts.append(pattern[prev:pos])
-            parts.append(replacement)
-            prev = pos + 1
-        parts.append(pattern[prev:])
-        yield "".join(parts)
+    segments: list[str | None] = []
+    prev = 0
+    for pos in positions:
+        segments.append(pattern[prev:pos])
+        segments.append(None)
+        prev = pos + 1
+    segments.append(pattern[prev:])
+
+    placeholder_indices = [idx for idx, segment in enumerate(segments) if segment is None]
+    template: list[str] = [segment if segment is not None else "" for segment in segments]
+
+    for combo in itertools.product(wildcard_tokens, repeat=len(placeholder_indices)):
+        for slot, replacement in zip(placeholder_indices, combo):
+            template[slot] = replacement
+        yield "".join(template)
 
 
 def iter_candidate_urls(
@@ -174,19 +184,14 @@ def iter_candidate_urls(
     if has_fuzz and not fuzz_values:
         raise ValueError("URL pattern contains FUZZ but no wordlist was supplied")
 
-    base_iterable: Iterable[str]
     if has_fuzz:
-        base_iterable = (pattern.replace("FUZZ", value) for value in fuzz_values)
+        segments = pattern.split("FUZZ")
+        base_iterable: Iterable[str] = (value.join(segments) for value in fuzz_values)
     else:
-        base_iterable = [pattern]
+        base_iterable = (pattern,)
 
-    seen: set[str] = set()
     for base in base_iterable:
-        for candidate in expand_question_marks(base, wildcard_tokens):
-            if candidate in seen:
-                continue
-            seen.add(candidate)
-            yield candidate
+        yield from expand_question_marks(base, wildcard_tokens)
 
 
 def parse_header_string(header: str) -> tuple[str, str]:
@@ -310,15 +315,19 @@ async def download_apk(
         return None
 
 
-def write_csv(csv_path: Path, records: list[ProbeResult]) -> None:
-    if not records:
-        return
-    csv_path.parent.mkdir(parents=True, exist_ok=True)
-    with csv_path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.writer(handle)
-        writer.writerow(["timestamp", "url", "status", "matched", "detail"])
-        for record in records:
-            writer.writerow(
+class CsvSink:
+    def __init__(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._handle = path.open("w", newline="", encoding="utf-8")
+        self._writer = csv.writer(self._handle)
+        self._writer.writerow(["timestamp", "url", "status", "matched", "detail"])
+        self._lock = asyncio.Lock()
+
+    async def write(self, record: ProbeResult) -> None:
+        if not self._handle:
+            return
+        async with self._lock:
+            self._writer.writerow(
                 [
                     record.timestamp.isoformat(),
                     record.url,
@@ -327,6 +336,25 @@ def write_csv(csv_path: Path, records: list[ProbeResult]) -> None:
                     record.detail,
                 ]
             )
+            self._handle.flush()
+
+    def close(self) -> None:
+        if self._handle:
+            self._handle.close()
+            self._handle = None
+
+
+class DownloadTracker:
+    def __init__(self) -> None:
+        self._seen: set[str] = set()
+        self._lock = asyncio.Lock()
+
+    async def claim(self, url: str) -> bool:
+        async with self._lock:
+            if url in self._seen:
+                return False
+            self._seen.add(url)
+            return True
 
 
 async def probe_once(
@@ -372,8 +400,9 @@ async def worker(
     stats: dict[str, int],
     download_dir: Path | None,
     download_headers: dict[str, str] | None,
-    csv_records: list[ProbeResult],
+    csv_sink: CsvSink | None,
     stop_event: asyncio.Event | None,
+    download_tracker: DownloadTracker | None,
 ) -> None:
     while True:
         url = await queue.get()
@@ -385,13 +414,16 @@ async def worker(
             continue
         stats["http_attempted"] += 1
         result = await probe_once(session, url, headers, match_bytes, match_statuses, logger)
-        csv_records.append(result)
+        if csv_sink:
+            await csv_sink.write(result)
         if result.matched:
             stats["matched"] += 1
             logger.info("MATCH %s (status=%s, bytes=%s)", result.url, result.status, result.detail)
             results.append(result)
-            if download_dir and download_headers:
-                await download_apk(session, url, download_headers, download_dir, logger)
+            if download_dir and download_headers and download_tracker:
+                should_download = await download_tracker.claim(url)
+                if should_download:
+                    await download_apk(session, url, download_headers, download_dir, logger)
             if stop_event:
                 stop_event.set()
         else:
@@ -408,11 +440,11 @@ async def resolver_worker(
     *,
     resolve_first: bool,
     resolution_cache: dict[str, bool],
-    resolution_lock: asyncio.Lock,
+    dns_resolver: aiodns.DNSResolver | None,
     limit_state: LimitState,
     stop_event: asyncio.Event | None,
     logger: logging.Logger,
-    csv_records: list[ProbeResult],
+    csv_sink: CsvSink | None,
     stats: dict[str, int],
     dns_timeout: float,
 ) -> None:
@@ -427,19 +459,19 @@ async def resolver_worker(
 
         if resolve_first:
             resolves, reason = await hostname_resolves(
-                url, resolution_cache, resolution_lock, timeout=dns_timeout
+                url, resolution_cache, dns_resolver, timeout=dns_timeout
             )
             if not resolves:
                 logger.debug("SKIP %s (hostname did not resolve)", url)
-                csv_records.append(
-                    ProbeResult(
-                        url=url,
-                        status=None,
-                        matched=False,
-                        detail=reason or "dns_skip",
-                        timestamp=datetime.now(timezone.utc),
-                    )
+                record = ProbeResult(
+                    url=url,
+                    status=None,
+                    matched=False,
+                    detail=reason or "dns_skip",
+                    timestamp=datetime.now(timezone.utc),
                 )
+                if csv_sink:
+                    await csv_sink.write(record)
                 stats["dns_failed"] += 1
                 candidate_queue.task_done()
                 continue
@@ -581,7 +613,7 @@ def parse_args() -> argparse.Namespace:
 async def hostname_resolves(
     url: str,
     cache: dict[str, bool],
-    lock: asyncio.Lock,
+    dns_resolver: aiodns.DNSResolver | None,
     timeout: float,
 ) -> tuple[bool, str | None]:
     parsed = urlsplit(url)
@@ -593,28 +625,31 @@ async def hostname_resolves(
     else:
         port = parsed.port or 80
     key = f"{host}:{port}"
-    async with lock:
-        cached = cache.get(key)
+    cached = cache.get(key)
     if cached is not None:
         return cached, None
 
-    loop = asyncio.get_running_loop()
     try:
-        await asyncio.wait_for(loop.getaddrinfo(host, port, type=socket.SOCK_STREAM), timeout=timeout)
-        async with lock:
-            cache[key] = True
+        if dns_resolver:
+            await asyncio.wait_for(
+                dns_resolver.gethostbyname(host, socket.AF_INET), timeout=timeout
+            )
+        else:
+            loop = asyncio.get_running_loop()
+            await asyncio.wait_for(
+                loop.getaddrinfo(host, port, type=socket.SOCK_STREAM), timeout=timeout
+            )
+        cache[key] = True
         return True, None
     except asyncio.TimeoutError:
-        async with lock:
-            cache[key] = False
+        cache[key] = False
         return False, "dns_timeout"
-    except OSError:
-        async with lock:
-            cache[key] = False
+    except (OSError, aiodns.error.DNSError):
+        cache[key] = False
         return False, "dns_error"
 
 
-async def run_scan(args: argparse.Namespace) -> tuple[list[ProbeResult], dict[str, int], list[ProbeResult]]:
+async def run_scan(args: argparse.Namespace) -> tuple[list[ProbeResult], dict[str, int]]:
     fuzz_values: list[str] = []
     if args.wordlist:
         fuzz_values = read_wordlist(args.wordlist)
@@ -638,7 +673,7 @@ async def run_scan(args: argparse.Namespace) -> tuple[list[ProbeResult], dict[st
     )
     timeout = aiohttp.ClientTimeout(total=args.timeout)
     ssl_flag = False if args.insecure else None
-    connector = aiohttp.TCPConnector(ssl=ssl_flag, limit_per_host=args.concurrency)
+    connector = aiohttp.TCPConnector(ssl=ssl_flag, limit=0, limit_per_host=args.concurrency)
     raw_headers = args.custom_headers or DEFAULT_CUSTOM_HEADERS.copy()
     custom_header_pairs = [parse_header_string(item) for item in raw_headers]
     headers = build_headers(custom_header_pairs, DEFAULT_UA)
@@ -657,90 +692,99 @@ async def run_scan(args: argparse.Namespace) -> tuple[list[ProbeResult], dict[st
         "http_attempted": 0,
         "matched": 0,
     }
-    csv_records: list[ProbeResult] = []
+    csv_sink: CsvSink | None = None
+    if args.csv_path:
+        csv_sink = CsvSink(args.csv_path)
     limit_state = LimitState(args.limit)
 
     stop_event: asyncio.Event | None = asyncio.Event() if args.stop_on_match else None
     resolution_cache: dict[str, bool] = {}
-    resolution_lock = asyncio.Lock()
     resolver_workers_count = args.resolve_concurrency if args.resolve_first else 1
+    download_tracker = DownloadTracker() if download_dir else None
+    dns_resolver: aiodns.DNSResolver | None = None
+    if args.resolve_first:
+        dns_resolver = aiodns.DNSResolver(flags=pycares.ARES_FLAG_NOSEARCH)
 
-    async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
-        workers = [
-            asyncio.create_task(
-                worker(
-                    idx,
-                    queue,
-                    session,
-                    headers,
-                    match_bytes,
-                    match_statuses,
-                    results,
-                    logger,
-                    stats,
-                    download_dir,
-                    download_headers,
-                    csv_records,
-                    stop_event,
+    try:
+        async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+            workers = [
+                asyncio.create_task(
+                    worker(
+                        idx,
+                        queue,
+                        session,
+                        headers,
+                        match_bytes,
+                        match_statuses,
+                        results,
+                        logger,
+                        stats,
+                        download_dir,
+                        download_headers,
+                        csv_sink,
+                        stop_event,
+                        download_tracker,
+                    )
                 )
-            )
-            for idx in range(args.concurrency)
-        ]
-        resolver_tasks = [
-            asyncio.create_task(
-                resolver_worker(
-                    candidate_queue,
-                    queue,
-                    resolve_first=args.resolve_first,
-                    resolution_cache=resolution_cache,
-                    resolution_lock=resolution_lock,
-                    limit_state=limit_state,
-                    stop_event=stop_event,
-                    logger=logger,
-                    csv_records=csv_records,
-                    stats=stats,
-                    dns_timeout=args.dns_timeout,
+                for idx in range(args.concurrency)
+            ]
+            resolver_tasks = [
+                asyncio.create_task(
+                    resolver_worker(
+                        candidate_queue,
+                        queue,
+                        resolve_first=args.resolve_first,
+                        resolution_cache=resolution_cache,
+                        dns_resolver=dns_resolver,
+                        limit_state=limit_state,
+                        stop_event=stop_event,
+                        logger=logger,
+                        csv_sink=csv_sink,
+                        stats=stats,
+                        dns_timeout=args.dns_timeout,
+                    )
                 )
-            )
-            for _ in range(resolver_workers_count)
-        ]
+                for _ in range(resolver_workers_count)
+            ]
 
-        async def produce_candidates() -> None:
-            for url in candidates:
-                if stop_event and stop_event.is_set():
-                    break
-                if args.limit is not None and limit_state.is_exhausted():
-                    break
-                stats["candidates"] += 1
-                await candidate_queue.put(url)
-            for _ in resolver_tasks:
-                await candidate_queue.put(None)
+            async def produce_candidates() -> None:
+                for url in candidates:
+                    if stop_event and stop_event.is_set():
+                        break
+                    if args.limit is not None and limit_state.is_exhausted():
+                        break
+                    stats["candidates"] += 1
+                    await candidate_queue.put(url)
+                for _ in resolver_tasks:
+                    await candidate_queue.put(None)
 
-        producer_task = asyncio.create_task(produce_candidates())
-        await producer_task
-        await candidate_queue.join()
-        await asyncio.gather(*resolver_tasks)
+            producer_task = asyncio.create_task(produce_candidates())
+            await producer_task
+            await candidate_queue.join()
+            await asyncio.gather(*resolver_tasks)
 
-        await queue.join()
+            await queue.join()
 
-        for _ in workers:
-            await queue.put(None)
+            for _ in workers:
+                await queue.put(None)
 
-        await asyncio.gather(*workers)
+            await asyncio.gather(*workers)
+    finally:
+        if csv_sink:
+            csv_sink.close()
+        if dns_resolver:
+            await dns_resolver.close()
 
-    return results, stats, csv_records
+    return results, stats
 
 
 def main() -> None:
     args = parse_args()
     try:
-        results, stats, csv_records = asyncio.run(run_scan(args))
+        results, stats = asyncio.run(run_scan(args))
     except Exception as exc:  # pragma: no cover - top level guard
         print(f"Error: {exc}")
         raise SystemExit(1)
-
-    if args.csv_path:
-        write_csv(args.csv_path, csv_records)
 
     if results:
         print("\nMatched hosts:")
