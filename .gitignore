@@ -1,0 +1,20 @@
+# Bytecode / caches
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+venv/
+.venv/
+
+# Run logs
+*.csv
+
+#Configs
+*.cfg
+
+# Editor junk
+*.swp
+*.swo
+.idea/
+.vscode/
+.DS_Store
