@@ -59,11 +59,14 @@ class LimitState:
     def is_exhausted(self) -> bool:
         return self._exhausted
 
-def read_wordlist(path: Path) -> list[str]:
-    if not path:
-        return []
+
+PLACEHOLDER_RE = re.compile(r"\{([^{}]*)\}")
+SPACE_NAME_RE = re.compile(r"^[A-Za-z0-9_]+$")
+
+
+def read_space_file(path: Path) -> list[str]:
     if not path.is_file():
-        raise FileNotFoundError(f"FUZZ file not found: {path}")
+        raise FileNotFoundError(f"Wildcard space file not found: {path}")
 
     values: list[str] = []
     with path.open("r", encoding="utf-8", errors="ignore") as handle:
@@ -74,10 +77,8 @@ def read_wordlist(path: Path) -> list[str]:
             values.append(value)
 
     if not values:
-        raise ValueError(f"FUZZ file {path} did not contain any usable values")
+        raise ValueError(f"Wildcard space file {path} did not contain any usable values")
 
-    # Preserve insertion order while removing duplicates up front so downstream
-    # enumeration does not need to maintain a giant seen-set per scan.
     return list(dict.fromkeys(values))
 
 
@@ -90,53 +91,139 @@ def expand_range(start: str, end: str) -> list[str]:
     return [chr(code) for code in range(start_ord, end_ord + step, step)]
 
 
-def parse_wildcard_space(spec: str) -> list[str]:
+def alpha_to_int(value: str) -> int:
+    total = 0
+    for char in value:
+        if not char.isalpha():
+            raise ValueError("Alphabetic ranges may only contain letters.")
+        digit = ord(char.lower()) - ord("a")
+        total = total * 26 + digit
+    return total
+
+
+def int_to_alpha(value: int, length: int, upper: bool) -> str:
+    letters = []
+    for _ in range(length):
+        value, digit = divmod(value, 26)
+        char = chr(ord("A" if upper else "a") + digit)
+        letters.append(char)
+    letters.reverse()
+    return "".join(letters)
+
+
+def alpha_min(length: int, upper: bool) -> str:
+    char = "A" if upper else "a"
+    return char * length
+
+
+def alpha_max(length: int, upper: bool) -> str:
+    char = "Z" if upper else "z"
+    return char * length
+
+
+def expand_alpha_range(start: str, end: str) -> list[str]:
+    if not start.isalpha() or not end.isalpha():
+        raise ValueError("Alphabetic ranges may only contain letters.")
+    start_upper = start.isupper()
+    end_upper = end.isupper()
+    if start_upper != end_upper:
+        raise ValueError("Alphabetic ranges must use the same case for start and end.")
+    if len(start) == len(end):
+        start_val = alpha_to_int(start)
+        end_val = alpha_to_int(end)
+        step = 1 if start_val <= end_val else -1
+        length = len(start)
+        values: list[str] = []
+        current = start_val
+        while True:
+            values.append(int_to_alpha(current, length, start_upper))
+            if current == end_val:
+                break
+            current += step
+        return values
+    if len(start) > len(end):
+        reversed_values = expand_alpha_range(end, start)
+        reversed_values.reverse()
+        return reversed_values
+
+    values: list[str] = []
+    # First length: start -> max of that length
+    values.extend(expand_alpha_range(start, alpha_max(len(start), start_upper)))
+    # Middle lengths (if any)
+    for length in range(len(start) + 1, len(end)):
+        values.extend(
+            expand_alpha_range(alpha_min(length, start_upper), alpha_max(length, start_upper))
+        )
+    # Final length: min -> end
+    values.extend(expand_alpha_range(alpha_min(len(end), start_upper), end))
+    return values
+
+
+def parse_inline_space(spec: str, spaces: dict[str, list[str]] | None = None) -> list[str]:
     if not spec:
         raise ValueError("Wildcard space spec cannot be empty.")
     tokens: list[str] = []
     seen: set[str] = set()
 
-    def add_token(token: str) -> None:
-        if not token:
-            raise ValueError("Empty wildcard token encountered.")
-        if token not in seen:
-            seen.add(token)
-            tokens.append(token)
+    def add_values(values: Iterable[str]) -> None:
+        for value in values:
+            if value not in seen:
+                seen.add(value)
+                tokens.append(value)
 
     for chunk in spec.split(","):
         chunk = chunk.strip()
         if not chunk:
             continue
-        i = 0
-        length = len(chunk)
-        while i < length:
-            if (
-                i + 2 < length
-                and chunk[i + 1] == "-"
-                and len(chunk[i]) == 1
-                and len(chunk[i + 2]) == 1
-            ):
-                for val in expand_range(chunk[i], chunk[i + 2]):
-                    add_token(val)
-                i += 3
-            else:
-                j = i
-                while j < length:
-                    if (
-                        j + 2 < length
-                        and chunk[j + 1] == "-"
-                        and len(chunk[j]) == 1
-                        and len(chunk[j + 2]) == 1
-                    ):
+        if spaces and chunk in spaces:
+            add_values(spaces[chunk])
+            continue
+        if chunk.startswith("{") and chunk.endswith("}"):
+            name = chunk[1:-1].strip()
+            if spaces and name in spaces:
+                add_values(spaces[name])
+                continue
+        if chunk.lower() == "null":
+            add_values([""])
+            continue
+        if chunk.count("-") == 1:
+            start, end = (part.strip() for part in chunk.split("-", 1))
+            if len(start) == 1 and len(end) == 1:
+                add_values(expand_range(start, end))
+                continue
+            if start.isdigit() and end.isdigit():
+                start_val = int(start)
+                end_val = int(end)
+                step = 1 if start_val <= end_val else -1
+                padded_width = len(start) if len(start) == len(end) else 0
+                current = start_val
+                values: list[str] = []
+                while True:
+                    if padded_width > 0:
+                        values.append(f"{current:0{padded_width}d}")
+                    else:
+                        values.append(str(current))
+                    if current == end_val:
                         break
-                    j += 1
-                literal = chunk[i:j].strip()
-                add_token(literal)
-                i = j
-
+                    current += step
+                add_values(values)
+                continue
+            if start.isalpha() and end.isalpha():
+                add_values(expand_alpha_range(start, end))
+                continue
+        add_values([chunk])
     if not tokens:
         raise ValueError("No valid wildcard tokens were produced.")
     return tokens
+
+
+def parse_space_spec(spec: str, spaces: dict[str, list[str]] | None = None) -> list[str]:
+    spec = spec.strip()
+    if not spec:
+        raise ValueError("Wildcard space spec cannot be empty.")
+    if spec.startswith("@"):
+        return read_space_file(Path(spec[1:]))
+    return parse_inline_space(spec, spaces)
 
 
 def parse_match_bytes(spec: str) -> bytes:
@@ -152,46 +239,71 @@ def parse_match_bytes(spec: str) -> bytes:
     return value
 
 
-def expand_question_marks(pattern: str, wildcard_tokens: Sequence[str]) -> Iterator[str]:
-    positions = [idx for idx, char in enumerate(pattern) if char == "?"]
-    if not positions:
+def parse_space_definitions(definitions: Sequence[str] | None) -> dict[str, list[str]]:
+    spaces: dict[str, list[str]] = {}
+    if not definitions:
+        return spaces
+    for raw in definitions:
+        if raw is None:
+            continue
+        cleaned = raw.strip()
+        if not cleaned:
+            continue
+        if "=" in cleaned:
+            name, spec = cleaned.split("=", 1)
+            name = name.strip()
+            spec = spec.strip()
+        else:
+            name = "default"
+            spec = cleaned
+        if not name:
+            raise ValueError("Wildcard space definitions must include a name before '='")
+        spaces[name] = parse_space_spec(spec, spaces)
+    return spaces
+
+
+def resolve_placeholder_tokens(label: str, spaces: dict[str, list[str]]) -> list[str]:
+    if not label:
+        tokens = spaces.get("default")
+        if tokens is None:
+            raise ValueError("Pattern used '{}' but no default wildcard space was defined (use -W spec or inline {tokens}).")
+        return tokens
+    trimmed = label.strip()
+    if SPACE_NAME_RE.fullmatch(trimmed):
+        tokens = spaces.get(trimmed)
+        if tokens is None:
+            raise ValueError(
+                f"Named wildcard space '{trimmed}' was referenced in the pattern but never defined."
+            )
+        return tokens
+    return parse_space_spec(trimmed, spaces)
+
+
+def iter_candidate_urls(pattern: str, spaces: dict[str, list[str]]) -> Iterator[str]:
+    segments: list[str] = []
+    placeholders: list[list[str]] = []
+    last = 0
+    for match in PLACEHOLDER_RE.finditer(pattern):
+        segments.append(pattern[last:match.start()])
+        placeholder_label = match.group(1).strip()
+        tokens = resolve_placeholder_tokens(placeholder_label, spaces)
+        placeholders.append(tokens)
+        last = match.end()
+    segments.append(pattern[last:])
+
+    if not placeholders:
+        if "{" in pattern or "}" in pattern:
+            raise ValueError("Unbalanced '{' or '}' detected in URL pattern.")
         yield pattern
         return
 
-    segments: list[str | None] = []
-    prev = 0
-    for pos in positions:
-        segments.append(pattern[prev:pos])
-        segments.append(None)
-        prev = pos + 1
-    segments.append(pattern[prev:])
-
-    placeholder_indices = [idx for idx, segment in enumerate(segments) if segment is None]
-    template: list[str] = [segment if segment is not None else "" for segment in segments]
-
-    for combo in itertools.product(wildcard_tokens, repeat=len(placeholder_indices)):
-        for slot, replacement in zip(placeholder_indices, combo):
-            template[slot] = replacement
-        yield "".join(template)
-
-
-def iter_candidate_urls(
-    pattern: str,
-    fuzz_values: Iterable[str],
-    wildcard_tokens: Sequence[str],
-) -> Iterator[str]:
-    has_fuzz = "FUZZ" in pattern
-    if has_fuzz and not fuzz_values:
-        raise ValueError("URL pattern contains FUZZ but no wordlist was supplied")
-
-    if has_fuzz:
-        segments = pattern.split("FUZZ")
-        base_iterable: Iterable[str] = (value.join(segments) for value in fuzz_values)
-    else:
-        base_iterable = (pattern,)
-
-    for base in base_iterable:
-        yield from expand_question_marks(base, wildcard_tokens)
+    for combo in itertools.product(*placeholders):
+        parts: list[str] = []
+        for idx, segment in enumerate(segments):
+            parts.append(segment)
+            if idx < len(combo):
+                parts.append(combo[idx])
+        yield "".join(parts)
 
 
 def parse_header_string(header: str) -> tuple[str, str]:
@@ -491,7 +603,7 @@ async def resolver_worker(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Fan out FUZZ tokens and '?' wildcards to fingerprint matching hosts.",
+        description="Enumerate named wildcard spaces such as {subdomain} to fingerprint matching hosts.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
@@ -501,23 +613,30 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "url_pattern",
-        help="URL containing optional FUZZ and '?' placeholders to enumerate",
+        help=(
+            "URL containing {space} placeholders. Use '{}' for the default space or {name} for named spaces;"
+            " inline specs like {a-z,0-9} are also supported."
+        ),
     )
 
     core_group = parser.add_argument_group("Core arguments")
     core_group.add_argument(
+        "-W",
+        "--wildcard-space",
+        dest="wildcard_spaces",
+        action="append",
+        metavar="SPACE",
+        help=(
+            "Define a wildcard space. Format: [-W name=]spec where spec supports comma-separated literals, ranges,"
+            " or '@file' to load newline-delimited tokens. Example: -W default=a-z -W hosts=@hosts.txt."
+        ),
+    )
+    parser.add_argument(
         "-w",
         "--wordlist",
-        type=Path,
-        help="Path to newline-delimited values used to replace FUZZ",
-    )
-    core_group.add_argument(
-        "--wildcard-space",
-        default="a-z",
-        help=(
-            "Tokens used when expanding '?' wildcards. Supports comma-separated literals "
-            "and single-character ranges like 'a-z', '0-9', or mixed specs such as 'a,k,z,5-8'."
-        ),
+        dest="deprecated_wordlist",
+        action="append",
+        help=argparse.SUPPRESS,
     )
     core_group.add_argument(
         "-c",
@@ -606,7 +725,22 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable verbose logging.",
     )
+    output_group.add_argument(
+        "--list-candidates",
+        action="store_true",
+        help="Print every generated URL combination and exit without issuing network requests.",
+    )
     args = parser.parse_args(_inject_config_args(parser))
+    if args.deprecated_wordlist:
+        parser.error(
+            "-w/--wordlist has been removed. Define wildcard spaces with -W name=@file and reference them as {name}."
+        )
+    if "FUZZ" in args.url_pattern:
+        parser.error("FUZZ placeholders were removed. Use named spaces like {payloads} instead.")
+    if "?" in args.url_pattern:
+        parser.error(
+            "'?' wildcards were removed. Replace them with {space} placeholders or encode literal '?' as %3F."
+        )
     return args
 
 
@@ -650,13 +784,27 @@ async def hostname_resolves(
 
 
 async def run_scan(args: argparse.Namespace) -> tuple[list[ProbeResult], dict[str, int]]:
-    fuzz_values: list[str] = []
-    if args.wordlist:
-        fuzz_values = read_wordlist(args.wordlist)
-    wildcard_tokens = parse_wildcard_space(args.wildcard_space)
+    spaces = parse_space_definitions(args.wildcard_spaces)
     match_bytes = parse_match_bytes(args.match_bytes)
     match_statuses = set(args.match_status) if args.match_status else {200, 206}
-    candidates = iter_candidate_urls(args.url_pattern, fuzz_values, wildcard_tokens)
+    candidates = iter_candidate_urls(args.url_pattern, spaces)
+
+    if args.list_candidates:
+        count = 0
+        limit = args.limit if args.limit and args.limit > 0 else None
+        for url in candidates:
+            print(url)
+            count += 1
+            if limit is not None and count >= limit:
+                break
+        stats = {
+            "candidates": count,
+            "dns_resolved": 0,
+            "dns_failed": 0,
+            "http_attempted": 0,
+            "matched": 0,
+        }
+        return [], stats
 
     if args.concurrency < 1:
         raise ValueError("Concurrency must be >= 1")
